@@ -2,7 +2,7 @@
 
 Cross-platform local subscription bridge for MahsaNG daily configs on **macOS, Linux, and Windows**.
 
-MahsaNG is great on Android. This project is the small missing bridge for desktop users: it fetches the encrypted feeds used by MahsaNG / MahsaFreeConfig, decrypts them locally, and exposes a standard V2Ray-style subscription URL that desktop proxy clients can import.
+[MahsaNG](https://github.com/GFW-knocker/MahsaNG) is great on Android. This project is the small missing bridge for desktop users: it fetches the encrypted feeds used by MahsaNG / MahsaFreeConfig, decrypts them locally, and exposes a standard V2Ray-style subscription URL that desktop proxy clients can import.
 
 It does **not** run a VPN by itself and it is **not** a replacement for the Android app. It is a companion tool that turns the daily MahsaNG ecosystem configs into a desktop-friendly local subscription.
 
