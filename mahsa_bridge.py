@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-MahsaNG macOS Bridge
+MahsaNG Desktop Bridge
 
-Local subscription bridge for MahsaNG/MahsaFreeConfig encrypted feeds.
+Cross-platform local subscription bridge for MahsaNG/MahsaFreeConfig encrypted feeds.
 It fetches live encrypted feeds, decrypts them using the same AES-CBC schemes
 found in the official MahsaNG Android APK, and serves standard V2Ray-style
-subscriptions for macOS clients.
+subscriptions for desktop clients on macOS, Linux, and Windows.
 
 Routes when serving:
   /sub    -> base64 newline-separated subscription payload
@@ -53,7 +53,7 @@ FREE_KEY_SEED = "mvcfhjju5632gfsseu95642yhfhnhjhty68532gfg"
 EMS_KEY_SEED = "aassddy734321thjmvbxcdgtt67i7kmghddfhfdxb"
 
 PROTOCOLS = ("vless://", "vmess://", "trojan://", "ss://")
-USER_AGENT = "MahsaNG-macOS-Bridge/1.0"
+USER_AGENT = "MahsaNG-Desktop-Bridge/1.1"
 DEFAULT_CACHE_SECONDS = 300
 
 
@@ -91,7 +91,7 @@ def fetch_text(url: str, timeout: int = 30) -> str:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return resp.read().decode("utf-8")
     except (ssl.SSLError, urllib.error.URLError) as exc:
-        # Some macOS Python builds do not have a usable cert bundle. Retry without
+        # Some local Python builds do not have a usable cert bundle. Retry without
         # TLS verification so the bridge still works. This is a public feed; the
         # decoded links are not credentials owned by this machine.
         if "CERTIFICATE_VERIFY_FAILED" not in str(exc) and not isinstance(exc, ssl.SSLError):
@@ -232,7 +232,7 @@ def serve(bind: str, source: Source, carrier: Carrier, timeout: int, cache_secon
     cache = BridgeCache(source=source, carrier=carrier, timeout=timeout, cache_seconds=cache_seconds)
 
     class Handler(BaseHTTPRequestHandler):
-        server_version = "MahsaNGMacBridge/1.0"
+        server_version = "MahsaNGDesktopBridge/1.1"
 
         def _send_text(self, status: int, body: str, content_type: str = "text/plain; charset=utf-8", extra: dict[str, str] | None = None) -> None:
             data = body.encode("utf-8")
@@ -297,7 +297,7 @@ def serve(bind: str, source: Source, carrier: Carrier, timeout: int, cache_secon
             print(f"[{self.log_date_time_string()}] {format % args}", file=sys.stderr)
 
     httpd = ThreadingHTTPServer((host, port), Handler)
-    print(f"MahsaNG macOS Bridge listening on http://{host}:{port}/sub", file=sys.stderr)
+    print(f"MahsaNG Desktop Bridge listening on http://{host}:{port}/sub", file=sys.stderr)
     print(f"Plain links: http://{host}:{port}/links", file=sys.stderr)
     print(f"Health:      http://{host}:{port}/health", file=sys.stderr)
     httpd.serve_forever()
@@ -313,7 +313,7 @@ def write_or_print(payload: str, output_path: str | None) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="MahsaNG encrypted feed decoder and local macOS subscription bridge")
+    parser = argparse.ArgumentParser(description="MahsaNG encrypted feed decoder and local desktop subscription bridge")
     parser.add_argument("--source", choices=("all", "free", "ems"), default="all")
     parser.add_argument("--carrier", choices=("all", "mtn", "mci"), default="all", help="Carrier filter for MahsaFreeConfig")
     parser.add_argument("--format", choices=("base64", "plain", "json"), default="base64")
