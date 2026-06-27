@@ -22,6 +22,8 @@ import base64
 import concurrent.futures
 import hashlib
 import json
+import re
+import random
 import ssl
 import sys
 import time
@@ -55,6 +57,7 @@ FREE_KEY_SEED = "mvcfhjju5632gfsseu95642yhfhnhjhty68532gfg"
 EMS_KEY_SEED = "aassddy734321thjmvbxcdgtt67i7kmghddfhfdxb"
 
 PROTOCOLS = ("vless://", "vmess://", "trojan://", "ss://")
+ANDROID_FREE_ROTATION_LIMIT = 10
 USER_AGENT = "MahsaNG-Desktop-Bridge/1.3"
 DEFAULT_CACHE_SECONDS = 300
 DEFAULT_TIMEOUT_SECONDS = 12
@@ -139,6 +142,31 @@ def dedupe_keep_order(items: Iterable[str]) -> list[str]:
     return result
 
 
+def normalize_android_free_link(raw: str) -> str:
+    raw = raw.strip()
+    raw = re.sub(r"\\u.{4}", "", raw)
+    raw = raw.replace("\\", "")
+    return raw.replace("&amp;", "&")
+
+
+def apply_android_rotation(entries: list[str], limit: int = ANDROID_FREE_ROTATION_LIMIT) -> list[str]:
+    if not entries:
+        return []
+
+    order = list(range(len(entries)))
+    random.shuffle(order)
+
+    selected: list[str] = []
+    for idx in order:
+        if len(selected) >= limit:
+            break
+        candidate = entries[idx].strip()
+        if candidate:
+            selected.append(candidate)
+
+    return selected
+
+
 def decode_free(carrier: Carrier = "all", timeout: int = 30) -> list[str]:
     encrypted = fetch_text(FREE_URL, timeout=timeout).strip()
     plain = aes_cbc_decrypt_base64(encrypted, free_key(), FREE_IV)
@@ -147,15 +175,20 @@ def decode_free(carrier: Carrier = "all", timeout: int = 30) -> list[str]:
         raise ValueError("MahsaFreeConfig payload is not a JSON object")
 
     carriers = ["mtn", "mci"] if carrier == "all" else [carrier]
-    links: list[str] = []
+    raw_links: list[str] = []
     for name in carriers:
         entries = data.get(name, [])
         if not isinstance(entries, list):
             continue
         for entry in entries:
-            if isinstance(entry, dict) and valid_link(entry.get("config")):
-                links.append(entry["config"].strip())
-    return links
+            if isinstance(entry, dict):
+                candidate = entry.get("config")
+                if isinstance(candidate, str):
+                    normalized = normalize_android_free_link(candidate)
+                    if normalized:
+                        raw_links.append(normalized)
+
+    return apply_android_rotation(raw_links)
 
 
 def decode_ems(timeout: int = 30) -> list[str]:
@@ -174,7 +207,7 @@ def decode_ems(timeout: int = 30) -> list[str]:
 
 def collect_links(source: Source = "all", carrier: Carrier = "all", timeout: int = DEFAULT_TIMEOUT_SECONDS) -> list[str]:
     if source == "free":
-        return dedupe_keep_order(decode_free(carrier=carrier, timeout=timeout))
+        return decode_free(carrier=carrier, timeout=timeout)
     if source == "ems":
         return dedupe_keep_order(decode_ems(timeout=timeout))
 
@@ -186,7 +219,7 @@ def collect_links(source: Source = "all", carrier: Carrier = "all", timeout: int
         ems_future = executor.submit(decode_ems, timeout=timeout)
         free_links = free_future.result()
         ems_links = ems_future.result()
-    return dedupe_keep_order([*free_links, *ems_links])
+    return [*free_links, *ems_links]
 
 
 def render_payload(links: list[str], output_format: OutputFormat) -> str:
