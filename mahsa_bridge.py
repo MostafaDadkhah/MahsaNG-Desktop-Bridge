@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import concurrent.futures
 import hashlib
 import json
 import ssl
@@ -53,8 +54,9 @@ FREE_KEY_SEED = "mvcfhjju5632gfsseu95642yhfhnhjhty68532gfg"
 EMS_KEY_SEED = "aassddy734321thjmvbxcdgtt67i7kmghddfhfdxb"
 
 PROTOCOLS = ("vless://", "vmess://", "trojan://", "ss://")
-USER_AGENT = "MahsaNG-Desktop-Bridge/1.2"
+USER_AGENT = "MahsaNG-Desktop-Bridge/1.3"
 DEFAULT_CACHE_SECONDS = 300
+DEFAULT_TIMEOUT_SECONDS = 12
 
 
 @dataclass
@@ -85,21 +87,26 @@ def ems_key() -> str:
     return digest[8:14] + digest[20:30]
 
 
-def fetch_text(url: str, timeout: int = 30) -> str:
+def fetch_text(url: str, timeout: int = DEFAULT_TIMEOUT_SECONDS) -> str:
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return resp.read().decode("utf-8")
-    except (ssl.SSLError, urllib.error.URLError) as exc:
-        # Some local Python builds do not have a usable cert bundle. Retry without
-        # TLS verification so the bridge still works. This is a public feed; the
-        # decoded links are not credentials owned by this machine.
-        if "CERTIFICATE_VERIFY_FAILED" not in str(exc) and not isinstance(exc, ssl.SSLError):
-            raise
-        print(f"warning: TLS verification failed for {url}; retrying without verification", file=sys.stderr)
-        ctx = ssl._create_unverified_context()
-        with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
-            return resp.read().decode("utf-8")
+    # Framework Python on macOS commonly lacks a working CA bundle in fresh user
+    # installs. Going through the failing verified handshake first made client
+    # subscription updates slow enough for Shadowrocket to keep old configs. The
+    # upstream feeds are public GitHub raw files, so use an unverified context for
+    # these fetches and retry once for transient GitHub/proxy TLS EOFs.
+    errors: list[str] = []
+    for attempt in range(2):
+        try:
+            ctx = ssl._create_unverified_context()
+            with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
+                return resp.read().decode("utf-8")
+        except (TimeoutError, ssl.SSLError, urllib.error.URLError, OSError) as exc:
+            errors.append(f"attempt {attempt + 1}: {type(exc).__name__}: {exc}")
+            if attempt == 0:
+                time.sleep(0.25)
+                continue
+            raise RuntimeError(f"fetch failed for {url}: {'; '.join(errors)}") from exc
+    raise RuntimeError(f"fetch failed for {url}")
 
 
 def aes_cbc_decrypt_base64(ciphertext_b64: str, key: str, iv: str) -> str:
@@ -160,13 +167,21 @@ def decode_ems(timeout: int = 30) -> list[str]:
     return links
 
 
-def collect_links(source: Source = "all", carrier: Carrier = "all", timeout: int = 30) -> list[str]:
-    links: list[str] = []
-    if source in ("all", "free"):
-        links.extend(decode_free(carrier=carrier, timeout=timeout))
-    if source in ("all", "ems"):
-        links.extend(decode_ems(timeout=timeout))
-    return dedupe_keep_order(links)
+def collect_links(source: Source = "all", carrier: Carrier = "all", timeout: int = DEFAULT_TIMEOUT_SECONDS) -> list[str]:
+    if source == "free":
+        return dedupe_keep_order(decode_free(carrier=carrier, timeout=timeout))
+    if source == "ems":
+        return dedupe_keep_order(decode_ems(timeout=timeout))
+
+    # Fetch free + EMS in parallel. Subscription clients such as Shadowrocket
+    # often have short update timeouts; sequential upstream fetches can make the
+    # client abandon the update and keep the previous imported configs.
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        free_future = executor.submit(decode_free, carrier=carrier, timeout=timeout)
+        ems_future = executor.submit(decode_ems, timeout=timeout)
+        free_links = free_future.result()
+        ems_links = ems_future.result()
+    return dedupe_keep_order([*free_links, *ems_links])
 
 
 def render_payload(links: list[str], output_format: OutputFormat) -> str:
@@ -234,7 +249,7 @@ def parse_bind(bind: str) -> tuple[str, int]:
 
 def make_handler(cache: SubscriptionCache) -> type[BaseHTTPRequestHandler]:
     class Handler(BaseHTTPRequestHandler):
-        server_version = "MahsaNGDesktopBridge/1.2"
+        server_version = "MahsaNGDesktopBridge/1.3"
 
         def _send_text(self, status: int, body: str, content_type: str = "text/plain; charset=utf-8", extra: dict[str, str] | None = None) -> None:
             data = body.encode("utf-8")
@@ -332,7 +347,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--carrier", choices=("all", "mtn", "mci"), default="all", help="Carrier filter for MahsaFreeConfig")
     parser.add_argument("--format", choices=("base64", "plain", "json"), default="base64")
     parser.add_argument("-o", "--output", help="Write subscription payload to a file")
-    parser.add_argument("--timeout", type=int, default=30)
+    parser.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT_SECONDS)
     parser.add_argument("--cache-seconds", type=int, default=DEFAULT_CACHE_SECONDS)
     parser.add_argument("--serve", nargs="?", const="127.0.0.1:18080", help="Serve a local subscription URL, optionally HOST:PORT")
     args = parser.parse_args(argv)
