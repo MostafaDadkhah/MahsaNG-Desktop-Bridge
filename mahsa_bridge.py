@@ -28,7 +28,7 @@ import urllib.request
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Iterable, Literal
+from typing import Any, Iterable, Literal, Protocol
 
 try:
     from cryptography.hazmat.primitives import padding
@@ -53,7 +53,7 @@ FREE_KEY_SEED = "mvcfhjju5632gfsseu95642yhfhnhjhty68532gfg"
 EMS_KEY_SEED = "aassddy734321thjmvbxcdgtt67i7kmghddfhfdxb"
 
 PROTOCOLS = ("vless://", "vmess://", "trojan://", "ss://")
-USER_AGENT = "MahsaNG-Desktop-Bridge/1.1"
+USER_AGENT = "MahsaNG-Desktop-Bridge/1.2"
 DEFAULT_CACHE_SECONDS = 300
 
 
@@ -180,6 +180,11 @@ def render_payload(links: list[str], output_format: OutputFormat) -> str:
     raise ValueError(f"Unsupported output format: {output_format}")
 
 
+class SubscriptionCache(Protocol):
+    def get(self, force: bool = False) -> FetchResult:
+        ...
+
+
 class BridgeCache:
     def __init__(self, source: Source, carrier: Carrier, timeout: int, cache_seconds: int) -> None:
         self.source = source
@@ -227,18 +232,17 @@ def parse_bind(bind: str) -> tuple[str, int]:
     return host or "127.0.0.1", int(port_text)
 
 
-def serve(bind: str, source: Source, carrier: Carrier, timeout: int, cache_seconds: int) -> None:
-    host, port = parse_bind(bind)
-    cache = BridgeCache(source=source, carrier=carrier, timeout=timeout, cache_seconds=cache_seconds)
-
+def make_handler(cache: SubscriptionCache) -> type[BaseHTTPRequestHandler]:
     class Handler(BaseHTTPRequestHandler):
-        server_version = "MahsaNGDesktopBridge/1.1"
+        server_version = "MahsaNGDesktopBridge/1.2"
 
         def _send_text(self, status: int, body: str, content_type: str = "text/plain; charset=utf-8", extra: dict[str, str] | None = None) -> None:
             data = body.encode("utf-8")
             self.send_response(status)
             self.send_header("Content-Type", content_type)
-            self.send_header("Cache-Control", "no-store")
+            self.send_header("Cache-Control", "no-store, no-cache, must-revalidate")
+            self.send_header("Pragma", "no-cache")
+            self.send_header("Expires", "0")
             self.send_header("Content-Length", str(len(data)))
             for key, value in (extra or {}).items():
                 self.send_header(key, value)
@@ -271,7 +275,10 @@ def serve(bind: str, source: Source, carrier: Carrier, timeout: int, cache_secon
                     self._send_text(404, "Use /sub, /links, /json, or /health\n")
                     return
 
-                result = cache.get(force=False)
+                # Client subscription update requests must observe the freshest
+                # upstream feeds. Cache is only a last-good fallback if refresh
+                # fails, not the normal response path for /sub, /links, or /json.
+                result = cache.get(force=True)
                 output_format: OutputFormat = "base64"
                 content_type = "text/plain; charset=utf-8"
                 if path == "/links":
@@ -288,6 +295,7 @@ def serve(bind: str, source: Source, carrier: Carrier, timeout: int, cache_secon
                     {
                         "X-Mahsa-Link-Count": str(len(result.links)),
                         "X-Mahsa-Stale": "1" if result.stale else "0",
+                        "X-Mahsa-Generated-At": str(result.generated_at),
                     },
                 )
             except Exception as exc:
@@ -296,7 +304,13 @@ def serve(bind: str, source: Source, carrier: Carrier, timeout: int, cache_secon
         def log_message(self, format: str, *args: Any) -> None:
             print(f"[{self.log_date_time_string()}] {format % args}", file=sys.stderr)
 
-    httpd = ThreadingHTTPServer((host, port), Handler)
+    return Handler
+
+
+def serve(bind: str, source: Source, carrier: Carrier, timeout: int, cache_seconds: int) -> None:
+    host, port = parse_bind(bind)
+    cache = BridgeCache(source=source, carrier=carrier, timeout=timeout, cache_seconds=cache_seconds)
+    httpd = ThreadingHTTPServer((host, port), make_handler(cache))
     print(f"MahsaNG Desktop Bridge listening on http://{host}:{port}/sub", file=sys.stderr)
     print(f"Plain links: http://{host}:{port}/links", file=sys.stderr)
     print(f"Health:      http://{host}:{port}/health", file=sys.stderr)

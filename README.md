@@ -144,7 +144,7 @@ The service installers accept environment variables or parameters:
 - Bind address: default `127.0.0.1:18080`
 - Source: `all`, `free`, or `ems`
 - Carrier for MahsaFreeConfig: `all`, `mtn`, or `mci`
-- Cache seconds: default `300`
+- Cache seconds: default `300` for `/health` status reuse; subscription endpoints always refresh upstream on each request and only use the last good snapshot as a fallback if refresh fails.
 
 Examples:
 
