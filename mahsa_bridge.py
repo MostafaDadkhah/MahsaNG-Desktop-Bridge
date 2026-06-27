@@ -12,6 +12,7 @@ Routes when serving:
   /links  -> plain newline-separated links
   /json   -> JSON array of links
   /health -> JSON status
+  /debug  -> JSON refresh diagnostics for humans
 """
 
 from __future__ import annotations
@@ -71,6 +72,10 @@ class FetchResult:
     @property
     def protocol_counts(self) -> dict[str, int]:
         return {proto: sum(link.startswith(proto) for link in self.links) for proto in PROTOCOLS}
+
+    @property
+    def payload_hash(self) -> str:
+        return hashlib.sha256("\n".join(self.links).encode("utf-8")).hexdigest()
 
 
 def md5_hex(text: str) -> str:
@@ -267,18 +272,24 @@ def make_handler(cache: SubscriptionCache) -> type[BaseHTTPRequestHandler]:
         def do_GET(self) -> None:  # noqa: N802 - stdlib callback name
             path = self.path.split("?", 1)[0]
             try:
-                if path == "/health":
-                    result = cache.get(force=False)
+                if path in ("/health", "/debug"):
+                    force_refresh = path == "/debug"
+                    result = cache.get(force=force_refresh)
                     body = json.dumps(
                         {
                             "ok": True,
+                            "endpoint": path,
+                            "refreshed_now": force_refresh,
                             "links": len(result.links),
+                            "payload_hash": result.payload_hash,
+                            "payload_hash_short": result.payload_hash[:16],
                             "protocol_counts": result.protocol_counts,
                             "source": result.source,
                             "carrier": result.carrier,
                             "generated_at": result.generated_at,
                             "stale": result.stale,
                             "error": result.error,
+                            "note": "Payload changes only when the upstream GitHub feeds change; generated_at changes on each forced refresh.",
                         },
                         ensure_ascii=False,
                         indent=2,
@@ -287,7 +298,7 @@ def make_handler(cache: SubscriptionCache) -> type[BaseHTTPRequestHandler]:
                     return
 
                 if path not in ("/", "/sub", "/links", "/json"):
-                    self._send_text(404, "Use /sub, /links, /json, or /health\n")
+                    self._send_text(404, "Use /sub, /links, /json, /health, or /debug\n")
                     return
 
                 # Client subscription update requests must observe the freshest

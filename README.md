@@ -8,12 +8,15 @@ It does **not** run a VPN by itself and it is **not** a replacement for the Andr
 
 ## Local URLs
 
-After running the bridge:
+Use the local URL in desktop clients:
 
-- Base64 subscription: `http://127.0.0.1:18080/sub`
-- Plain links: `http://127.0.0.1:18080/links`
+- Subscription URL: `http://127.0.0.1:18080/sub`
+- Plain links for inspection: `http://127.0.0.1:18080/links`
 - JSON links: `http://127.0.0.1:18080/json`
 - Health/status: `http://127.0.0.1:18080/health`
+- Human refresh diagnostics: `http://127.0.0.1:18080/debug`
+
+`/sub`, `/links`, `/json`, and `/debug` force a fresh upstream fetch on every request. If the body stays identical while `generated_at` changes, the upstream feeds have not changed yet.
 
 Use `/sub` in clients that expect a normal V2Ray subscription URL.
 
