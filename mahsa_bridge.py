@@ -27,7 +27,9 @@ import random
 import ssl
 import sys
 import time
+import uuid
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -167,6 +169,43 @@ def apply_android_rotation(entries: list[str], limit: int = ANDROID_FREE_ROTATIO
     return selected
 
 
+def append_refresh_marker(title: str) -> str:
+    marker = uuid.uuid4().hex[:8]
+    return f"{title} · mahsa-{marker}" if title else f"mahsa-{marker}"
+
+
+def add_android_style_refresh_identity(link: str) -> str:
+    """Make each free-feed import visibly fresh without changing credentials.
+
+    The Android app wraps each selected free config with a per-import random
+    fake UUID/address mapping before import. Desktop clients do not have that
+    MahsaNG-native mapping layer, so changing host or credential UUID would
+    break otherwise valid proxy links. Instead, vary only the display name
+    fragment/remark; Shadowrocket treats the fetched subscription as fresh, but
+    the proxy endpoint and credentials stay intact.
+    """
+    if link.startswith("vmess://"):
+        try:
+            encoded = link.removeprefix("vmess://")
+            encoded += "=" * ((4 - len(encoded) % 4) % 4)
+            config = json.loads(base64.b64decode(encoded).decode("utf-8"))
+            if isinstance(config, dict):
+                config["ps"] = append_refresh_marker(str(config.get("ps") or ""))
+                refreshed = base64.b64encode(
+                    json.dumps(config, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+                ).decode("ascii")
+                return "vmess://" + refreshed
+        except Exception:
+            return link
+
+    if link.startswith(("vless://", "trojan://", "ss://")):
+        base_part, sep, fragment = link.partition("#")
+        title = urllib.parse.unquote(fragment) if sep else ""
+        return base_part + "#" + urllib.parse.quote(append_refresh_marker(title), safe="")
+
+    return link
+
+
 def decode_free(carrier: Carrier = "all", timeout: int = 30) -> list[str]:
     encrypted = fetch_text(FREE_URL, timeout=timeout).strip()
     plain = aes_cbc_decrypt_base64(encrypted, free_key(), FREE_IV)
@@ -188,7 +227,7 @@ def decode_free(carrier: Carrier = "all", timeout: int = 30) -> list[str]:
                     if normalized:
                         raw_links.append(normalized)
 
-    return apply_android_rotation(raw_links)
+    return [add_android_style_refresh_identity(link) for link in apply_android_rotation(raw_links)]
 
 
 def decode_ems(timeout: int = 30) -> list[str]:
