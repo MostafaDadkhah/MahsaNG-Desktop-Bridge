@@ -9,7 +9,7 @@ param(
 $ErrorActionPreference = "Stop"
 
 if ([string]::IsNullOrWhiteSpace($Bind)) { $Bind = "127.0.0.1:18080" }
-if ([string]::IsNullOrWhiteSpace($Source)) { $Source = "all" }
+if ([string]::IsNullOrWhiteSpace($Source)) { $Source = "android" }
 if ([string]::IsNullOrWhiteSpace($Carrier)) { $Carrier = "all" }
 if ([string]::IsNullOrWhiteSpace($CacheSeconds)) { $CacheSeconds = "300" }
 

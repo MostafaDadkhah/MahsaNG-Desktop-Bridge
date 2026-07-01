@@ -20,11 +20,15 @@ from __future__ import annotations
 import argparse
 import base64
 import concurrent.futures
+import gzip
 import hashlib
+import http.client
 import json
+import os
 import re
 import random
 import ssl
+import subprocess
 import sys
 import time
 import uuid
@@ -32,9 +36,15 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
+from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Iterable, Literal, Protocol
+
+try:
+    from zoneinfo import ZoneInfo
+except Exception:  # pragma: no cover - Python < 3.9 fallback
+    ZoneInfo = None  # type: ignore[assignment]
 
 try:
     from cryptography.hazmat.primitives import padding
@@ -46,23 +56,36 @@ except Exception as exc:
         "  python3 -m pip install cryptography"
     ) from exc
 
-Source = Literal["all", "free", "ems"]
+Source = Literal["android", "dynamic", "all", "free", "ems"]
 Carrier = Literal["all", "mtn", "mci"]
 OutputFormat = Literal["base64", "plain", "json"]
 
 FREE_URL = "https://raw.githubusercontent.com/mahsanet/MahsaFreeConfig/main/app/sub.txt"
 EMS_URL = "https://raw.githubusercontent.com/GFW-knocker/MahsaNG/master/mahsa_EMS_accounts.json"
+REMOTE_UPDATE_URL = "https://raw.githubusercontent.com/GFW-knocker/MahsaNG/master/remote_config_update_v14.json"
 
 FREE_IV = "lvcas56410c97lpb"       # APK q/c
 EMS_IV = "Xvc1wOrxs77Ilj0N"        # APK q/e
+ANDROID_API_IV = "lvcas56410c97lpb" # APK j/j
 FREE_KEY_SEED = "mvcfhjju5632gfsseu95642yhfhnhjhty68532gfg"
 EMS_KEY_SEED = "aassddy734321thjmvbxcdgtt67i7kmghddfhfdxb"
+ANDROID_PACKAGE = "com.MahsaNet.MahsaNG"
+# MD5 of the DER signing certificate from META-INF/BNDLTOOL.RSA, matching APK Lj/h.e().
+ANDROID_SIGNATURE_MD5 = "d63b2eabf70b5fefc6ac38be9923bd1b"
+ANDROID_CLIENT_VERSION = "14"
+ANDROID_CLIENT_SOURCE = "g"
+ANDROID_TIMEZONE = os.environ.get("MAHSA_ANDROID_TIMEZONE", "Asia/Tehran")
+ANDROID_DYNAMIC_ENDPOINTS = (
+    "https://www.mahsaserver.com",
+    "https://r1.mahsaserver.com",
+)
 
 PROTOCOLS = ("vless://", "vmess://", "trojan://", "ss://")
 ANDROID_FREE_ROTATION_LIMIT = 10
-USER_AGENT = "MahsaNG-Desktop-Bridge/1.3"
+USER_AGENT = "MahsaNG-Desktop-Bridge/1.4"
 DEFAULT_CACHE_SECONDS = 300
 DEFAULT_TIMEOUT_SECONDS = 12
+DEFAULT_BIND = "0.0.0.0:18080"
 
 
 @dataclass
@@ -97,6 +120,33 @@ def ems_key() -> str:
     return digest[8:14] + digest[20:30]
 
 
+def seeded_substring(seed: str, start: int, end: int) -> str:
+    return md5_hex(seed)[start:end]
+
+
+def remote_update_key() -> str:
+    seed = "fsq7ncdlh1iu85642gnnvderhjkl77igfdgnfd"
+    return seeded_substring(seed, 10, 17) + seeded_substring(seed, 20, 29)
+
+
+def android_dynamic_request_key() -> str:
+    seed = "tzqkkkad476mvcnneeq19087hnmggbalmnytcx55"
+    return seeded_substring(seed, 10, 17) + seeded_substring(seed, 20, 29)
+
+
+def android_dynamic_response_key() -> str:
+    seed = "cnfhjkreewbnkis43hza65r4354756hgbfvdrsgfk"
+    return seeded_substring(seed, 0, 7) + seeded_substring(seed, 10, 19)
+
+
+def android_dynamic_token_salt() -> str:
+    return seeded_substring("jfdvgjk5643790jgvdhnmddhssnyyy9521gfnbvfty", 4, 23)
+
+
+def android_provider_salt() -> str:
+    return seeded_substring("lmvbfgi5i94234ybssdul89853gjmnvreey9863bf", 5, 28)
+
+
 def fetch_text(url: str, timeout: int = DEFAULT_TIMEOUT_SECONDS) -> str:
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
     # Framework Python on macOS commonly lacks a working CA bundle in fresh user
@@ -110,13 +160,65 @@ def fetch_text(url: str, timeout: int = DEFAULT_TIMEOUT_SECONDS) -> str:
             ctx = ssl._create_unverified_context()
             with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
                 return resp.read().decode("utf-8")
-        except (TimeoutError, ssl.SSLError, urllib.error.URLError, OSError) as exc:
+        except (TimeoutError, ssl.SSLError, urllib.error.URLError, http.client.IncompleteRead, OSError) as exc:
             errors.append(f"attempt {attempt + 1}: {type(exc).__name__}: {exc}")
             if attempt == 0:
                 time.sleep(0.25)
                 continue
-            raise RuntimeError(f"fetch failed for {url}: {'; '.join(errors)}") from exc
+            try:
+                return curl_fetch_bytes(url, timeout=timeout).decode("utf-8")
+            except Exception as curl_exc:
+                errors.append(f"curl fallback: {type(curl_exc).__name__}: {curl_exc}")
+                raise RuntimeError(f"fetch failed for {url}: {'; '.join(errors)}") from exc
     raise RuntimeError(f"fetch failed for {url}")
+
+
+def curl_fetch_bytes(
+    url: str,
+    timeout: int = DEFAULT_TIMEOUT_SECONDS,
+    method: str = "GET",
+    data: bytes | None = None,
+    headers: dict[str, str] | None = None,
+) -> bytes:
+    """Fetch through curl as a runtime-network fallback.
+
+    macOS Python `urllib` can hang on local system proxies that curl handles
+    correctly. Curl uses the active system route/proxy without the bridge
+    hardwiring any VPN-specific port.
+    """
+    cmd = [
+        "curl",
+        "-fsSL",
+        "--compressed",
+        "--connect-timeout",
+        str(max(1, min(timeout, 8))),
+        "--max-time",
+        str(max(2, timeout + 5)),
+        "-k",
+    ]
+    effective_headers = dict(headers or {})
+    if "User-Agent" not in effective_headers:
+        effective_headers["User-Agent"] = USER_AGENT
+    for key, value in effective_headers.items():
+        cmd.extend(["-H", f"{key}: {value}"])
+    if method.upper() != "GET":
+        cmd.extend(["-X", method.upper()])
+    if data is not None:
+        cmd.extend(["--data-binary", "@-"])
+    cmd.append(url)
+    result = subprocess.run(cmd, input=data, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout + 8)
+    if result.returncode != 0:
+        stderr = result.stderr.decode("utf-8", "replace").strip()
+        raise RuntimeError(f"curl exited {result.returncode}: {stderr[:300]}")
+    return result.stdout
+
+
+def aes_cbc_encrypt_base64(plain: str, key: str, iv: str) -> str:
+    padder = padding.PKCS7(128).padder()
+    padded = padder.update(plain.encode("utf-8")) + padder.finalize()
+    encryptor = Cipher(algorithms.AES(key.encode("utf-8")), modes.CBC(iv.encode("utf-8"))).encryptor()
+    ciphertext = encryptor.update(padded) + encryptor.finalize()
+    return base64.b64encode(ciphertext).decode("ascii")
 
 
 def aes_cbc_decrypt_base64(ciphertext_b64: str, key: str, iv: str) -> str:
@@ -126,6 +228,232 @@ def aes_cbc_decrypt_base64(ciphertext_b64: str, key: str, iv: str) -> str:
     unpadder = padding.PKCS7(128).unpadder()
     plain = unpadder.update(padded) + unpadder.finalize()
     return plain.decode("utf-8")
+
+
+class DynamicCaptchaRequired(RuntimeError):
+    def __init__(self, captcha_id: str, captcha_img: str) -> None:
+        super().__init__(f"Mahsa dynamic API requires captcha_id={captcha_id}")
+        self.captcha_id = captcha_id
+        self.captcha_img = captcha_img
+
+
+def android_h_b(request_time: str) -> str:
+    return md5_hex(md5_hex(ANDROID_PACKAGE) + ANDROID_SIGNATURE_MD5[4:12] + request_time)
+
+
+def android_h1(client_ip: str, request_time: str) -> str:
+    material = (
+        client_ip
+        + md5_hex(ANDROID_PACKAGE)[10:18]
+        + ANDROID_SIGNATURE_MD5[18:29]
+        + request_time
+        + android_h_b(request_time)
+    )
+    return md5_hex(material)[10:20]
+
+
+def android_h_d(part_16: str, secret: str, salt: str, short_head: str, short_tail: str) -> str:
+    material = md5_hex(part_16)[2:27] + secret + short_head + md5_hex(salt)[3:25] + secret + short_tail
+    return md5_hex(material)[:20]
+
+
+def generate_android_token(part_16: str | None = None, short_code: str | None = None) -> str:
+    """Reproduce APK `Lj/k.a(..., ..., q())` token construction."""
+    part_16 = part_16 or md5_hex(str(uuid.uuid4()))[:16]
+    short_code = short_code or md5_hex(str(uuid.uuid4()))[:8]
+    nonce_hash = md5_hex(str(uuid.uuid4()))
+    nonce_a = nonce_hash[:7]
+    nonce_b = nonce_hash[7:17]
+    nonce_c = nonce_hash[17:24]
+    nonce_joined = nonce_a + nonce_b + nonce_c
+    secret = nonce_joined[5:9] + nonce_joined[14:18] + nonce_joined[20:22]
+    code_head = short_code[:3]
+    code_tail = short_code[3:]
+    signed = android_h_d(part_16, secret, android_dynamic_token_salt(), code_head, code_tail)
+    return (
+        nonce_a
+        + part_16[:5]
+        + signed[:12]
+        + code_tail
+        + nonce_b
+        + signed[12:20]
+        + code_head
+        + part_16[5:]
+        + nonce_c
+    )
+
+
+def generate_provider_code(part_16: str | None = None) -> str:
+    part_16 = part_16 or md5_hex(str(uuid.uuid4()))[:16]
+    return md5_hex(part_16 + android_provider_salt())[:8]
+
+
+def android_local_time() -> str:
+    if ZoneInfo is not None:
+        try:
+            return datetime.now(ZoneInfo(ANDROID_TIMEZONE)).strftime("%Y%m%d_%H%M%S")
+        except Exception:
+            pass
+    return datetime.now().strftime("%Y%m%d_%H%M%S")
+
+
+def fetch_public_ip(timeout: int = 5) -> str:
+    configured = os.environ.get("MAHSA_CLIENT_IP", "").strip()
+    if configured:
+        return configured
+    public_ip_urls = (
+        "https://checkip.amazonaws.com/",
+        "https://api.ipify.org/",
+        "https://icanhazip.com/",
+    )
+    for url in public_ip_urls:
+        try:
+            candidate = curl_fetch_bytes(url, timeout=max(2, min(timeout, 4))).decode("utf-8").strip()
+            if re.fullmatch(r"\d{1,3}(?:\.\d{1,3}){3}", candidate):
+                return candidate
+        except Exception:
+            continue
+    return ""
+
+
+def build_android_dynamic_request(
+    hashes: list[str] | None = None,
+    provider_code: str | None = None,
+    captcha_id: str = "",
+    captcha_input: str = "",
+    client_ip: str | None = None,
+    connected: bool = True,
+) -> tuple[str, str, dict[str, Any]]:
+    request_timestamp = int(time.time())
+    signed_request_time = str(request_timestamp)
+    request_time = signed_request_time
+    local_time = android_local_time()
+    if connected:
+        request_time += " UTC"
+        local_time += " UTC"
+    client_ip = client_ip if client_ip is not None else fetch_public_ip()
+    body: dict[str, Any] = {
+        "hashes": hashes if hashes is not None else ["aaa", "bbb"],
+        "h1": android_h1(client_ip, signed_request_time),
+        "provider_code": provider_code if provider_code is not None else "",
+        "timezone": ANDROID_TIMEZONE,
+        "request_time": request_time,
+        "request_timestamp": request_timestamp,
+        "local_time": local_time,
+        "client_ip": client_ip,
+        "client_version": ANDROID_CLIENT_VERSION,
+        "client_source": ANDROID_CLIENT_SOURCE,
+        "captcha_id": captcha_id,
+        "captcha_input": captcha_input,
+    }
+    body_json = json.dumps(body, separators=(",", ":"), ensure_ascii=False)
+    ciphertext = aes_cbc_encrypt_base64(body_json, android_dynamic_request_key(), ANDROID_API_IV)
+    return generate_android_token(), ciphertext, body
+
+
+def post_android_dynamic_ciphertext(url: str, request_ciphertext: str, timeout: int) -> str:
+    # The custom Android lib posts a JSON string whose value is the encrypted
+    # payload. Posting the raw ciphertext gets HTTP 415/403 from the backend.
+    data = json.dumps(request_ciphertext).encode("utf-8")
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "*/*",
+        "User-Agent": "MahsaNG/14",
+    }
+    req = urllib.request.Request(
+        url,
+        data=data,
+        method="POST",
+        headers=headers,
+    )
+    ctx = ssl._create_unverified_context()
+    try:
+        with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
+            raw = resp.read()
+            encoding = resp.headers.get("Content-Encoding", "")
+            if encoding.lower() == "gzip" or raw[:2] == b"\x1f\x8b":
+                raw = gzip.decompress(raw)
+            return raw.decode("ascii")
+    except (TimeoutError, ssl.SSLError, urllib.error.URLError, http.client.IncompleteRead, OSError):
+        raw = curl_fetch_bytes(url, timeout=timeout, method="POST", data=data, headers=headers)
+        if raw[:2] == b"\x1f\x8b":
+            raw = gzip.decompress(raw)
+        return raw.decode("ascii")
+
+
+def decrypt_android_dynamic_response(response_ciphertext: str) -> dict[str, Any]:
+    plain = aes_cbc_decrypt_base64(response_ciphertext, android_dynamic_response_key(), ANDROID_API_IV)
+    data = json.loads(plain)
+    if not isinstance(data, dict):
+        raise ValueError("Mahsa dynamic response is not a JSON object")
+    return data
+
+
+def decode_remote_update(timeout: int = DEFAULT_TIMEOUT_SECONDS) -> dict[str, Any]:
+    encrypted = fetch_text(REMOTE_UPDATE_URL, timeout=timeout).strip()
+    plain = aes_cbc_decrypt_base64(encrypted, remote_update_key(), EMS_IV)
+    data = json.loads(plain)
+    if not isinstance(data, dict):
+        raise ValueError("Mahsa remote update payload is not a JSON object")
+    return data
+
+
+def android_dynamic_endpoint_bases(timeout: int = DEFAULT_TIMEOUT_SECONDS) -> list[str]:
+    configured = os.environ.get("MAHSA_DYNAMIC_ENDPOINTS")
+    bases = [item.strip().rstrip("/") for item in configured.split(",")] if configured else []
+    bases.extend(ANDROID_DYNAMIC_ENDPOINTS)
+    # `remote_config_update_v14.json` currently exposes `mahsa_endpoints` as
+    # bare IPs used by Android's network helpers, not as TLS backend hostnames.
+    # Treating them as `https://<ip>/backend/...` makes unattended refreshes wait
+    # through avoidable TLS/SNI timeouts. Keep them opt-in for diagnostics only.
+    if os.environ.get("MAHSA_USE_REMOTE_UPDATE_ENDPOINTS") == "1":
+        try:
+            remote = decode_remote_update(timeout=timeout)
+            update = remote.get("update_setting", {})
+            endpoints = update.get("mahsa_endpoints", []) if isinstance(update, dict) else []
+            if isinstance(endpoints, list):
+                for endpoint in endpoints:
+                    if isinstance(endpoint, str) and endpoint.strip():
+                        value = endpoint.strip().rstrip("/")
+                        if not value.startswith(("http://", "https://")):
+                            value = "https://" + value
+                        bases.append(value)
+        except Exception:
+            pass
+    return dedupe_keep_order(bases)
+
+
+def fetch_android_dynamic(
+    timeout: int = DEFAULT_TIMEOUT_SECONDS,
+    captcha_id: str = "",
+    captcha_input: str = "",
+) -> list[str]:
+    token, request_ciphertext, _body = build_android_dynamic_request(
+        captcha_id=captcha_id,
+        captcha_input=captcha_input,
+    )
+    path = "/backend/app_api/v7/config_fetch/?token=" + urllib.parse.quote(token, safe="")
+    errors: list[str] = []
+    for base in android_dynamic_endpoint_bases(timeout=timeout):
+        url = base.rstrip("/") + path
+        try:
+            response_ciphertext = post_android_dynamic_ciphertext(url, request_ciphertext, timeout=timeout)
+            data = decrypt_android_dynamic_response(response_ciphertext)
+            if data.get("is_captcha") is True:
+                raise DynamicCaptchaRequired(str(data.get("captcha_id") or ""), str(data.get("captcha_img") or ""))
+            configs = data.get("configs", [])
+            if not isinstance(configs, list):
+                raise ValueError("Mahsa dynamic response 'configs' is not a list")
+            links: list[str] = []
+            for entry in configs:
+                if isinstance(entry, dict) and valid_link(entry.get("url")):
+                    links.append(str(entry["url"]).strip())
+            return dedupe_keep_order(links)
+        except DynamicCaptchaRequired:
+            raise
+        except Exception as exc:
+            errors.append(f"{base}: {type(exc).__name__}: {exc}")
+    raise RuntimeError("Mahsa dynamic fetch failed: " + "; ".join(errors))
 
 
 def valid_link(value: Any) -> bool:
@@ -244,7 +572,25 @@ def decode_ems(timeout: int = 30) -> list[str]:
     return links
 
 
-def collect_links(source: Source = "all", carrier: Carrier = "all", timeout: int = DEFAULT_TIMEOUT_SECONDS) -> list[str]:
+def collect_links(source: Source = "android", carrier: Carrier = "all", timeout: int = DEFAULT_TIMEOUT_SECONDS) -> list[str]:
+    if source == "dynamic":
+        return fetch_android_dynamic(timeout=timeout)
+    if source == "android":
+        try:
+            dynamic_links = fetch_android_dynamic(timeout=timeout)
+            if dynamic_links:
+                return dynamic_links
+        except DynamicCaptchaRequired:
+            # Android itself falls back to MAHSA_SUB when the dynamic m1() path
+            # asks for a captcha. Preserve that behavior so unattended desktop
+            # clients keep receiving usable configs without mixing in EMS.
+            pass
+        except Exception:
+            # Keep the desktop bridge self-healing: dynamic API failures should
+            # not strand Shadowrocket when the Android MAHSA_SUB backup is alive.
+            pass
+        return decode_free(carrier=carrier, timeout=timeout)
+
     if source == "free":
         return decode_free(carrier=carrier, timeout=timeout)
     if source == "ems":
@@ -326,7 +672,7 @@ def parse_bind(bind: str) -> tuple[str, int]:
 
 def make_handler(cache: SubscriptionCache) -> type[BaseHTTPRequestHandler]:
     class Handler(BaseHTTPRequestHandler):
-        server_version = "MahsaNGDesktopBridge/1.3"
+        server_version = "MahsaNGDesktopBridge/1.4"
 
         def _send_text(self, status: int, body: str, content_type: str = "text/plain; charset=utf-8", extra: dict[str, str] | None = None) -> None:
             data = body.encode("utf-8")
@@ -361,7 +707,7 @@ def make_handler(cache: SubscriptionCache) -> type[BaseHTTPRequestHandler]:
                             "generated_at": result.generated_at,
                             "stale": result.stale,
                             "error": result.error,
-                            "note": "Payload changes only when the upstream GitHub feeds change; generated_at changes on each forced refresh.",
+                            "note": "source=android tries the live Mahsa dynamic API first, then falls back to Android MAHSA_SUB rotation if the API requires captcha or fails.",
                         },
                         ensure_ascii=False,
                         indent=2,
@@ -426,13 +772,18 @@ def write_or_print(payload: str, output_path: str | None) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="MahsaNG encrypted feed decoder and local desktop subscription bridge")
-    parser.add_argument("--source", choices=("all", "free", "ems"), default="all")
+    parser.add_argument(
+        "--source",
+        choices=("android", "dynamic", "all", "free", "ems"),
+        default="android",
+        help="android=dynamic Mahsa API first, then Android MAHSA_SUB rotation; dynamic=only live backend",
+    )
     parser.add_argument("--carrier", choices=("all", "mtn", "mci"), default="all", help="Carrier filter for MahsaFreeConfig")
     parser.add_argument("--format", choices=("base64", "plain", "json"), default="base64")
     parser.add_argument("-o", "--output", help="Write subscription payload to a file")
     parser.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT_SECONDS)
     parser.add_argument("--cache-seconds", type=int, default=DEFAULT_CACHE_SECONDS)
-    parser.add_argument("--serve", nargs="?", const="127.0.0.1:18080", help="Serve a local subscription URL, optionally HOST:PORT")
+    parser.add_argument("--serve", nargs="?", const=DEFAULT_BIND, help="Serve a local/LAN subscription URL, optionally HOST:PORT")
     args = parser.parse_args(argv)
 
     if args.serve:

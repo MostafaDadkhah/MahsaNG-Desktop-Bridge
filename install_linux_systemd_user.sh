@@ -4,8 +4,11 @@ set -euo pipefail
 LABEL="com.mostafa.mahsang.bridge"
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
-BIND="${BIND:-127.0.0.1:18080}"
-SOURCE="${SOURCE:-all}"
+# Bind to all interfaces by default so LAN clients such as Shadowrocket can
+# update from http://<linux-lan-ip>:18080/sub. Override with
+# BIND=127.0.0.1:18080 for local-only desktop clients.
+BIND="${BIND:-0.0.0.0:18080}"
+SOURCE="${SOURCE:-android}"
 CARRIER="${CARRIER:-all}"
 CACHE_SECONDS="${CACHE_SECONDS:-300}"
 UNIT_DIR="$HOME/.config/systemd/user"
@@ -13,7 +16,7 @@ UNIT_FILE="$UNIT_DIR/$LABEL.service"
 LOG_DIR="$PROJECT_DIR/logs"
 
 if ! command -v systemctl >/dev/null 2>&1; then
-  echo "systemctl not found. Use manual mode instead: python3 mahsa_bridge.py --serve 127.0.0.1:18080" >&2
+  echo "systemctl not found. Use manual mode instead: python3 mahsa_bridge.py --serve 0.0.0.0:18080" >&2
   exit 1
 fi
 
@@ -62,5 +65,10 @@ echo "Installed and started $LABEL for Linux/systemd user session"
 echo "Subscription: http://$BIND/sub"
 echo "Plain links:   http://$BIND/links"
 echo "Health:        http://$BIND/health"
+if [[ "$BIND" == 0.0.0.0:* ]]; then
+  PORT="${BIND##*:}"
+  echo "LAN URLs:"
+  hostname -I 2>/dev/null | tr ' ' '\n' | awk -v port="$PORT" 'NF && $1 !~ /^127\./ {printf "  http://%s:%s/sub\n", $1, port}'
+fi
 echo "Unit:          $UNIT_FILE"
 echo "Logs:          $LOG_DIR"

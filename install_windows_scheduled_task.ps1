@@ -1,6 +1,6 @@
 param(
     [string]$Bind = "127.0.0.1:18080",
-    [string]$Source = "all",
+    [string]$Source = "android",
     [string]$Carrier = "all",
     [int]$CacheSeconds = 300,
     [string]$TaskName = "MahsaNGDesktopBridge"
